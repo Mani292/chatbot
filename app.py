@@ -1,24 +1,34 @@
 from flask import Flask, request, jsonify, Response
 import google.generativeai as genai
-import random, difflib
+import random, difflib, os, logging
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # -----------------------------
-# Configure Gemini (replace with a valid key!)
-# -----------------------------
-genai.configure(api_key="AIzaSyDLrht-Clb5hT8eIL_61FOg974kYOR3gws")
+"""
+Configure Gemini API key securely from environment variable.
+Set the environment variable GEMINI_API_KEY before running.
+"""
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    logging.error("Gemini API key not found. Set GEMINI_API_KEY environment variable.")
+    raise RuntimeError("Gemini API key not found.")
+genai.configure(api_key=api_key)
 model = genai.GenerativeModel("gemini-1.5-flash")
 
 # -----------------------------
 # Memory
 # -----------------------------
-chat_history = []
+chat_history = []  # type: list[dict[str, str]]
+MAX_HISTORY = 50  # Limit history to avoid memory issues
 
 # -----------------------------
 # Correction helper
 # -----------------------------
-def correct_word(user_input, expected_words):
+
+def correct_word(user_input: str, expected_words: list[str]) -> str:
+    """Corrects user input words based on expected words using fuzzy matching."""
     words = user_input.split()
     corrected = []
     for w in words:
@@ -33,17 +43,24 @@ expected_words = ["learn", "earn", "java", "python", "money", "future", "wisdom"
 # -----------------------------
 @app.route("/chat", methods=["POST"])
 def chat():
+    """Chat endpoint for user-bot interaction."""
     global chat_history
-    user_message = request.json["message"].strip()
+    user_message = request.json.get("message", "").strip()
+    if not user_message:
+        return jsonify({"reply": "⚠️ Please enter a message.", "corrected": ""}), 400
     corrected_input = correct_word(user_message.lower(), expected_words)
 
     chat_history.append({"role": "user", "text": corrected_input})
+    # Limit history size
+    if len(chat_history) > MAX_HISTORY:
+        chat_history = chat_history[-MAX_HISTORY:]
 
     prompt = "\n".join([f"{m['role'].upper()}: {m['text']}" for m in chat_history[-10:]])
     try:
         response = model.generate_content(prompt)
         reply = response.text if response else "⚠️ Cosmic signal lost…"
     except Exception as e:
+        logging.error(f"Gemini error: {e}")
         reply = f"⚠️ Error: {str(e)}"
 
     chat_history.append({"role": "bot", "text": reply})
@@ -54,6 +71,7 @@ def chat():
 # -----------------------------
 @app.route("/clear", methods=["POST"])
 def clear():
+    """Endpoint to clear chat history."""
     global chat_history
     chat_history = []
     return jsonify({"status": "cleared"})
@@ -61,13 +79,17 @@ def clear():
 # -----------------------------
 # Frontend
 # -----------------------------
+
 @app.route("/")
 def index():
+    """Serve the frontend HTML page."""
     html = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta name="description" content="Cosmic AI chatbot powered by Gemini." />
         <title>🌌 Cosmic AI ✨</title>
         <style>
             body {font-family:'Segoe UI',sans-serif;background:linear-gradient(160deg,#0a0a2a,#1a1a4a);color:#e0e0ff;margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;}
@@ -87,13 +109,13 @@ def index():
     <body>
         <h1>🌌 Cosmic AI ✨</h1>
         <div id="controls">
-            <button onclick="clearChat()">🗑️ Clear Chat</button>
+            <button onclick="clearChat()" aria-label="Clear chat">🗑️ Clear Chat</button>
         </div>
-        <div id="chat"></div>
+        <div id="chat" aria-live="polite"></div>
         <div id="typing"></div>
         <div id="input-area">
-            <input type="text" id="userInput" placeholder="Ask me anything..." onkeypress="if(event.key==='Enter'){sendMessage();}" />
-            <button onclick="sendMessage()">Send</button>
+            <input type="text" id="userInput" placeholder="Ask me anything..." aria-label="User input" onkeypress="if(event.key==='Enter'){sendMessage();}" />
+            <button onclick="sendMessage()" aria-label="Send message">Send</button>
         </div>
         <script>
             async function sendMessage(){
@@ -105,34 +127,38 @@ def index():
                 userMsg.className="msg user"; userMsg.innerText=message;
                 chatBox.appendChild(userMsg); chatBox.scrollTop=chatBox.scrollHeight; input.value="";
                 document.getElementById("typing").innerText="Cosmic AI is thinking... 🌌";
-                const response=await fetch("/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:message})});
-                const data=await response.json();
-                document.getElementById("typing").innerText="";
-                if(data.corrected && data.corrected.toLowerCase()!==message.toLowerCase()){
-                    let correction=document.createElement("div");
-                    correction.className="msg bot";
-                    correction.innerHTML="<i>(Did you mean: "+data.corrected+"?)</i>";
-                    chatBox.appendChild(correction);
+                try {
+                    const response=await fetch("/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:message})});
+                    const data=await response.json();
+                    document.getElementById("typing").innerText="";
+                    if(data.corrected && data.corrected.toLowerCase()!==message.toLowerCase()){
+                        let correction=document.createElement("div");
+                        correction.className="msg bot";
+                        correction.innerHTML="<i>(Did you mean: "+data.corrected+"?)</i>";
+                        chatBox.appendChild(correction);
+                    }
+                    let botMsg=document.createElement("div");
+                    botMsg.className="msg bot";
+                    let urlMatch=data.reply.match(/(https?:\/\/[^\s]+)/g);
+                    if(urlMatch){
+                        let textWithLinks=data.reply.replace(/(https?:\/\/[^\s]+)/g,function(url){return '<a href="'+url+'" target="_blank" style="color:#ff9;">'+url+'</a>';});
+                        botMsg.innerHTML=textWithLinks;
+                    } else {
+                        let text=data.reply; botMsg.innerHTML=""; chatBox.appendChild(botMsg);
+                        let i=0; function typeWriter(){if(i<text.length){botMsg.innerHTML+=text.charAt(i);i++;setTimeout(typeWriter,15);chatBox.scrollTop=chatBox.scrollHeight;}}
+                        typeWriter(); return;
+                    }
+                    chatBox.appendChild(botMsg); chatBox.scrollTop=chatBox.scrollHeight;
+                } catch (err) {
+                    document.getElementById("typing").innerText="Error contacting server.";
                 }
-                let botMsg=document.createElement("div");
-                botMsg.className="msg bot";
-                let urlMatch=data.reply.match(/(https?:\\/\\/[^\\s]+)/g);
-                if(urlMatch){
-                    let textWithLinks=data.reply.replace(/(https?:\\/\\/[^\\s]+)/g,function(url){return '<a href="'+url+'" target="_blank" style="color:#ff9;">'+url+'</a>';});
-                    botMsg.innerHTML=textWithLinks;
-                } else {
-                    let text=data.reply; botMsg.innerHTML=""; chatBox.appendChild(botMsg);
-                    let i=0; function typeWriter(){if(i<text.length){botMsg.innerHTML+=text.charAt(i);i++;setTimeout(typeWriter,15);chatBox.scrollTop=chatBox.scrollHeight;}}
-                    typeWriter(); return;
-                }
-                chatBox.appendChild(botMsg); chatBox.scrollTop=chatBox.scrollHeight;
             }
             async function clearChat(){await fetch("/clear",{method:"POST"});document.getElementById("chat").innerHTML="";}
         </script>
     </body>
     </html>
     """
-    return Response(html,mimetype="text/html")
+    return Response(html, mimetype="text/html")
 
 if __name__=="__main__":
     app.run(debug=True)
